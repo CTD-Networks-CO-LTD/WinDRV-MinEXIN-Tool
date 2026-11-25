@@ -413,9 +413,14 @@ function Get-UnhealthyOrUnboundDevices {
             continue
         }
 
-        # 3. DSP有効マルチメディアオーディオ（PCI\CC_0401）へのインボックスINF強制適用
-        $compatIds = @((Get-DeviceHardwareAndCompatibleIds -Device $dev -HwIdsByDev $HwIdsByDev -CompatIdsByDev $CompatIdsByDev).CompatibleIds)
-        $isSstDsp = ($id -match '(?i)PCI\\VEN_8086&DEV_54C8' -or ($compatIds -match '(?i)PCI\\CC_0401'))
+        # 3. DSP有効マルチメディアオーディオ（PCI\CC_0401 / CC_040380）へのインボックスINF強制適用
+        #    ※ Intel SST 等の DSP が有効なオーディオコントローラはクラスコードが CC_0401 または CC_040380 となり、
+        #       OEM製SSTバスドライバ（IntcAudioBus.sys等）が必須となる。
+        #       一方、BIOSでDSPが無効（標準HD Audioモード）の場合はクラスコードが CC_0403 / CC_040300 となり、
+        #       Windows標準インボックス（hdaudbus.inf）での稼働が正規仕様のため除外する。
+        $idPair = Get-DeviceHardwareAndCompatibleIds -Device $dev -HwIdsByDev $HwIdsByDev -CompatIdsByDev $CompatIdsByDev
+        $allIds = @(@($idPair.HardwareIds) + @($idPair.CompatibleIds))
+        $isSstDsp = ($allIds -match '(?i)PCI\\CC_0401|&CC_0401|&CC_040380')
         if ($isSstDsp) {
             $isOem = ($primaryInf -match '(?i)^oem\d+\.inf$')
             if (-not $isOem) {
