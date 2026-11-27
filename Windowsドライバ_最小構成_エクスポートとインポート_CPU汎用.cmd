@@ -220,11 +220,12 @@ function Test-ExpectedDriverlessRawDevice {
         [Parameter(Mandatory = $true)]$Device,
         [AllowEmptyString()][string]$PrimaryInf = '',
         [hashtable]$HwIdsByDev = @{},
-        [hashtable]$CompatIdsByDev = @{}
+        [hashtable]$CompatIdsByDev = @{},
+        [hashtable]$DevNodeStatusByDev = @{}
     )
     if (-not $Device -or -not $Device.InstanceId) { return $false }
 
-    # PnP 問題コードが発生しているデバイス（Code 28 / Code 10 等）は除外しない
+    # PnP 問題コードが発生しているデバイス（Code 28 / Code 10 / Code 43 等）は除外しない
     $prob = 0
     if ($Device.PSObject.Properties['Problem'] -and $null -ne $Device.Problem) {
         $prob = [int]$Device.Problem
@@ -232,11 +233,48 @@ function Test-ExpectedDriverlessRawDevice {
     if ($prob -ne 0) { return $false }
 
     $devClass = if ($Device.PSObject.Properties['Class'] -and $Device.Class) { [string]$Device.Class } else { '' }
-    if (-not [string]::IsNullOrWhiteSpace($devClass) -or -not [string]::IsNullOrWhiteSpace($PrimaryInf)) {
+    if ((-not [string]::IsNullOrWhiteSpace($devClass) -and $devClass -ine 'Unknown') -or -not [string]::IsNullOrWhiteSpace($PrimaryInf)) {
         return $false
     }
 
     $id = ([string]$Device.InstanceId).Trim()
+
+    # 0. デバイスマネージャー通常表示での非表示ノード (DN_NO_SHOW_IN_DM = 0x40000000)
+    $rawStatus = $null
+    if ($DevNodeStatusByDev -and $DevNodeStatusByDev.ContainsKey($id) -and $null -ne $DevNodeStatusByDev[$id]) {
+        $rawStatus = $DevNodeStatusByDev[$id]
+    } elseif ($Device.PSObject.Properties['DevNodeStatus'] -and $null -ne $Device.DevNodeStatus) {
+        $rawStatus = $Device.DevNodeStatus
+    }
+    if ($null -ne $rawStatus) {
+        $statusVal = [uint32]0
+        $parsedStatus = $false
+        if ($rawStatus -is [uint32]) {
+            $statusVal = $rawStatus; $parsedStatus = $true
+        } elseif ($rawStatus -is [int]) {
+            $statusVal = [BitConverter]::ToUInt32([BitConverter]::GetBytes($rawStatus), 0); $parsedStatus = $true
+        } elseif ($rawStatus -is [long]) {
+            $statusVal = [BitConverter]::ToUInt32([BitConverter]::GetBytes([long]$rawStatus), 0); $parsedStatus = $true
+        } elseif ($rawStatus -is [uint64]) {
+            $statusVal = [uint32]([uint64]$rawStatus -band [uint64]0xFFFFFFFF); $parsedStatus = $true
+        } else {
+            $sRaw = ([string]$rawStatus).Trim()
+            if ($sRaw -match '^0[xX]([0-9A-Fa-f]+)$') {
+                $parsedStatus = [uint32]::TryParse($Matches[1], [System.Globalization.NumberStyles]::HexNumber, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$statusVal)
+            } else {
+                $parsedStatus = [uint32]::TryParse($sRaw, [ref]$statusVal)
+            }
+        }
+        if ($parsedStatus) {
+            # DN_HAS_PROBLEM (0x0400) または DN_PRIVATE_PROBLEM (0x8000) が設定されている場合は除外しない
+            if (($statusVal -band [uint32]0x00008400) -ne 0) { return $false }
+            if (($statusVal -band [uint32]0x40000000) -ne 0) { return $true }
+        }
+    }
+
+    # これ以降の個別・構造ルールは Class が空の場合のみ対象とする
+    if (-not [string]::IsNullOrWhiteSpace($devClass)) { return $false }
+
     $idPair = Get-DeviceHardwareAndCompatibleIds -Device $Device -HwIdsByDev $HwIdsByDev -CompatIdsByDev $CompatIdsByDev
     $hwIds = @($idPair.HardwareIds)
     $compatIds = @($idPair.CompatibleIds)
@@ -251,7 +289,13 @@ function Test-ExpectedDriverlessRawDevice {
     # 2. Realtek Bluetooth フィルタ (RtkBtFilter2.sys) 等の内部制御用 RAW PDO
     if ($id -match '^(?i)\{742787E2-EA40-4366-8FB4-DE98EE777D7C\}\\RTKFILTER') { return $true }
 
-    # 3. HardwareIds / CompatibleIds を一切報告しない非物理バス上の内部 RAW PDO
+    # 3. USB4 ホストルーター (Usb4HostRouter.sys) が列挙する電力協調用 RAW PDO (USB4\VIRTUAL_POWER_PDO*)
+    if ($id -match '^(?i)USB4\\VIRTUAL_POWER_PDO(?:&|\\|$)') { return $true }
+    foreach ($hw in $hwIds) {
+        if ($hw -match '^(?i)USB4\\VIRTUAL_POWER_PDO(?:&|\\|$)') { return $true }
+    }
+
+    # 4. HardwareIds / CompatibleIds を一切報告しない非物理バス上の内部 RAW PDO
     #    （PnP 仕様上いかなる INF もマッチング対象にならず、親ドライバが直接 I/O を処理するノード）
     if ($hwIds.Count -eq 0 -and $compatIds.Count -eq 0) {
         $hasExplicitIdSource = (
@@ -263,7 +307,7 @@ function Test-ExpectedDriverlessRawDevice {
             ($null -ne $Device.PSObject.Properties['CompatibleID']) -or
             ($null -ne $Device.PSObject.Properties['CompatibleIds'])
         )
-        $isStandardHardwareBus = ($id -match '^(?i)(PCI|ACPI|USB|HDAUDIO|INTELAUDIO|SD|SCSI|NVME|HID|UEFI)\\')
+        $isStandardHardwareBus = ($id -match '^(?i)(PCI|ACPI|USB|USB4|HDAUDIO|INTELAUDIO|SD|SCSI|NVME|HID|UEFI)\\')
         if ($hasExplicitIdSource -and -not $isStandardHardwareBus) {
             return $true
         }
@@ -282,6 +326,7 @@ function Get-SafePnpDeviceProperties {
     $results = New-Object System.Collections.Generic.List[object]
     $pnpCmd = Get-Command -Name 'Get-PnpDeviceProperty' -ErrorAction SilentlyContinue
     $isNativePnpModule = ($null -ne $pnpCmd -and $pnpCmd.ModuleName -eq 'PnpDevice')
+    $hasThrottleLimit = ($isNativePnpModule -and $null -ne $pnpCmd.Parameters -and $pnpCmd.Parameters.ContainsKey('ThrottleLimit'))
 
     $cimDevices = @()
     $fallbackIds = New-Object System.Collections.Generic.List[string]
@@ -308,51 +353,66 @@ function Get-SafePnpDeviceProperties {
         }
     }
 
-    # CimInstance 直接渡しにより WQL 長大化による WBEM_E_QUOTA_VIOLATION（クォータ違反）を回避する
-    if ($cimDevices.Count -gt 0) {
-        $cimProps = @(Get-PnpDeviceProperty -InputObject $cimDevices -KeyName $KeyNames -ErrorAction SilentlyContinue)
-        if ($cimProps.Count -gt 0) {
-            foreach ($p in $cimProps) { if ($null -ne $p) { $results.Add($p) } }
-        } elseif ($KeyNames.Count -gt 1) {
-            foreach ($k in $KeyNames) {
-                Get-PnpDeviceProperty -InputObject $cimDevices -KeyName $k -ErrorAction SilentlyContinue | ForEach-Object {
-                    if ($null -ne $_) { $results.Add($_) }
-                }
-            }
-        }
-    }
-
-    # モック環境や非CimInstance向けの安全な小バッチ分割（WMI クエリ長・OR条件数上限を十分に下回るサイズ）
-    if ($fallbackIds.Count -gt 0) {
-        $chunks = New-Object System.Collections.Generic.List[object]
-        $curChunk = New-Object System.Collections.Generic.List[string]
-        $curChars = 0
-        foreach ($sId in $fallbackIds) {
-            $len = $sId.Length + 32
-            if ($curChunk.Count -gt 0 -and ($curChunk.Count -ge 30 -or ($curChars + $len) -gt 3000)) {
-                $chunks.Add([string[]]$curChunk.ToArray())
-                $curChunk = New-Object System.Collections.Generic.List[string]
-                $curChars = 0
-            }
-            $curChunk.Add($sId)
-            $curChars += $len
-        }
-        if ($curChunk.Count -gt 0) {
-            $chunks.Add([string[]]$curChunk.ToArray())
-        }
-
-        foreach ($chunk in $chunks) {
-            $chunkProps = @(Get-PnpDeviceProperty -InstanceId $chunk -KeyName $KeyNames -ErrorAction SilentlyContinue)
-            if ($chunkProps.Count -gt 0) {
-                foreach ($cp in $chunkProps) { if ($null -ne $cp) { $results.Add($cp) } }
+    $prevProgress = $global:ProgressPreference
+    try {
+        $global:ProgressPreference = 'SilentlyContinue'
+        # CimInstance 直接渡しにより WQL 長大化による WBEM_E_QUOTA_VIOLATION（クォータ違反）を回避し、
+        # ThrottleLimit 1 により WMI プロバイダ内部の並列競合（DeviceID 混入・欠落）を防止する
+        if ($cimDevices.Count -gt 0) {
+            $cimArgs = @{ InputObject = $cimDevices; KeyName = $KeyNames; ErrorAction = 'SilentlyContinue' }
+            if ($hasThrottleLimit) { $cimArgs['ThrottleLimit'] = 1 }
+            $cimProps = @(Get-PnpDeviceProperty @cimArgs)
+            if ($cimProps.Count -gt 0) {
+                foreach ($p in $cimProps) { if ($null -ne $p) { $results.Add($p) } }
             } elseif ($KeyNames.Count -gt 1) {
                 foreach ($k in $KeyNames) {
-                    Get-PnpDeviceProperty -InstanceId $chunk -KeyName $k -ErrorAction SilentlyContinue | ForEach-Object {
+                    $singleArgs = @{ InputObject = $cimDevices; KeyName = $k; ErrorAction = 'SilentlyContinue' }
+                    if ($hasThrottleLimit) { $singleArgs['ThrottleLimit'] = 1 }
+                    Get-PnpDeviceProperty @singleArgs | ForEach-Object {
                         if ($null -ne $_) { $results.Add($_) }
                     }
                 }
             }
         }
+
+        # モック環境や非CimInstance向けの安全な小バッチ分割（WMI クエリ長・OR条件数上限を十分に下回るサイズ）
+        if ($fallbackIds.Count -gt 0) {
+            $chunks = New-Object System.Collections.Generic.List[object]
+            $curChunk = New-Object System.Collections.Generic.List[string]
+            $curChars = 0
+            foreach ($sId in $fallbackIds) {
+                $len = $sId.Length + 32
+                if ($curChunk.Count -gt 0 -and ($curChunk.Count -ge 30 -or ($curChars + $len) -gt 3000)) {
+                    $chunks.Add([string[]]$curChunk.ToArray())
+                    $curChunk = New-Object System.Collections.Generic.List[string]
+                    $curChars = 0
+                }
+                $curChunk.Add($sId)
+                $curChars += $len
+            }
+            if ($curChunk.Count -gt 0) {
+                $chunks.Add([string[]]$curChunk.ToArray())
+            }
+
+            foreach ($chunk in $chunks) {
+                $chunkArgs = @{ InstanceId = $chunk; KeyName = $KeyNames; ErrorAction = 'SilentlyContinue' }
+                if ($hasThrottleLimit) { $chunkArgs['ThrottleLimit'] = 1 }
+                $chunkProps = @(Get-PnpDeviceProperty @chunkArgs)
+                if ($chunkProps.Count -gt 0) {
+                    foreach ($cp in $chunkProps) { if ($null -ne $cp) { $results.Add($cp) } }
+                } elseif ($KeyNames.Count -gt 1) {
+                    foreach ($k in $KeyNames) {
+                        $singleChunkArgs = @{ InstanceId = $chunk; KeyName = $k; ErrorAction = 'SilentlyContinue' }
+                        if ($hasThrottleLimit) { $singleChunkArgs['ThrottleLimit'] = 1 }
+                        Get-PnpDeviceProperty @singleChunkArgs | ForEach-Object {
+                            if ($null -ne $_) { $results.Add($_) }
+                        }
+                    }
+                }
+            }
+        }
+    } finally {
+        $global:ProgressPreference = $prevProgress
     }
 
     return $results.ToArray()
@@ -363,7 +423,8 @@ function Get-UnhealthyOrUnboundDevices {
         [Parameter(Mandatory = $true)][array]$Devices,
         [hashtable]$InfByDev = @{},
         [hashtable]$HwIdsByDev = @{},
-        [hashtable]$CompatIdsByDev = @{}
+        [hashtable]$CompatIdsByDev = @{},
+        [hashtable]$DevNodeStatusByDev = @{}
     )
     $results = New-Object System.Collections.ArrayList
     foreach ($dev in $Devices) {
@@ -397,9 +458,9 @@ function Get-UnhealthyOrUnboundDevices {
             continue
         }
 
-        # 2. Null Driver（「ほかのデバイス」状態）: Class が空 かつ DriverInfPath が空
-        if ([string]::IsNullOrWhiteSpace($devClass) -and [string]::IsNullOrWhiteSpace($primaryInf)) {
-            if (Test-ExpectedDriverlessRawDevice -Device $dev -PrimaryInf $primaryInf -HwIdsByDev $HwIdsByDev -CompatIdsByDev $CompatIdsByDev) {
+        # 2. Null Driver（「ほかのデバイス」状態）: Class が空または 'Unknown' かつ DriverInfPath が空
+        if (([string]::IsNullOrWhiteSpace($devClass) -or $devClass -ieq 'Unknown') -and [string]::IsNullOrWhiteSpace($primaryInf)) {
+            if (Test-ExpectedDriverlessRawDevice -Device $dev -PrimaryInf $primaryInf -HwIdsByDev $HwIdsByDev -CompatIdsByDev $CompatIdsByDev -DevNodeStatusByDev $DevNodeStatusByDev) {
                 continue
             }
             [void]$results.Add([PSCustomObject]@{
@@ -445,7 +506,8 @@ function Get-CoreCategoryStatus {
         [hashtable]$InfByDev = @{},
         [hashtable]$DriverMap = @{},
         [hashtable]$HwIdsByDev = @{},
-        [hashtable]$CompatIdsByDev = @{}
+        [hashtable]$CompatIdsByDev = @{},
+        [hashtable]$DevNodeStatusByDev = @{}
     )
     $categories = @(
         @{ Key = 'Audio';     Name = 'オーディオ (SST / ACP / コーデック / Display Audio)' },
@@ -469,7 +531,7 @@ function Get-CoreCategoryStatus {
                 [string]$dev.Name
             } else { $id }
             $inf = if ($InfByDev.ContainsKey($id)) { [string]$InfByDev[$id] } else { '' }
-            if (Test-ExpectedDriverlessRawDevice -Device $dev -PrimaryInf $inf -HwIdsByDev $HwIdsByDev -CompatIdsByDev $CompatIdsByDev) { continue }
+            if (Test-ExpectedDriverlessRawDevice -Device $dev -PrimaryInf $inf -HwIdsByDev $HwIdsByDev -CompatIdsByDev $CompatIdsByDev -DevNodeStatusByDev $DevNodeStatusByDev) { continue }
 
             $match = $false
             switch ($cat.Key) {
@@ -835,18 +897,59 @@ function Assert-DriverCatalogSignatures {
     $infFiles = @(Get-ChildItem -LiteralPath $Root -Recurse -File -Filter '*.inf' -Force -ErrorAction Stop)
     if ($infFiles.Count -eq 0) { throw "保存先に INF ファイルが見つかりません: $Root" }
 
+    $procArch = if ($env:PROCESSOR_ARCHITEW6432) { [string]$env:PROCESSOR_ARCHITEW6432 } else { [string]$env:PROCESSOR_ARCHITECTURE }
+    $procArch = $procArch.Trim().ToUpperInvariant()
+    $archSuffix = switch ($procArch) {
+        'AMD64' { 'NTAMD64' }
+        'ARM64' { 'NTARM64' }
+        'X86'   { 'NTX86' }
+        default { '' }
+    }
+
     $verified = New-Object 'System.Collections.Generic.List[object]'
     $missing = New-Object 'System.Collections.Generic.List[object]'
     foreach ($infFile in $infFiles) {
         $infDir = $infFile.DirectoryName
         $lines = Read-InfTextLines -FilePath $infFile.FullName
-        $catalogNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        $inVersion = $false
+        $hasVersionSection = $false
+        $catalogsBySuffix = @{}
+        $allDeclaredCatalogs = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 
         foreach ($line in $lines) {
-            if ($line -match '^\s*CatalogFile(?:\.[^=]+)?\s*=\s*([^;]+)') {
-                $catLeaf = [System.IO.Path]::GetFileName($Matches[1].Trim().Trim('"'))
-                if ($catLeaf) { [void]$catalogNames.Add($catLeaf) }
+            $cleanLine = ($line -replace ';.*$', '').Trim()
+            if (-not $cleanLine) { continue }
+            if ($cleanLine -match '^\[([^\]]+)\]') {
+                $secName = $Matches[1].Trim()
+                $inVersion = ($secName -ieq 'Version')
+                if ($inVersion) { $hasVersionSection = $true }
+                continue
             }
+            if ($hasVersionSection -and -not $inVersion) { continue }
+            if ($cleanLine -match '^\s*CatalogFile(?:\.([^=\s]+))?\s*=\s*(.+)$') {
+                $suffixKey = if ($Matches[1]) { $Matches[1].Trim().ToUpperInvariant() } else { '' }
+                $catLeaf = [System.IO.Path]::GetFileName($Matches[2].Trim().Trim('"'))
+                if ($catLeaf) {
+                    [void]$allDeclaredCatalogs.Add($catLeaf)
+                    if (-not $catalogsBySuffix.ContainsKey($suffixKey)) {
+                        $catalogsBySuffix[$suffixKey] = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+                    }
+                    [void]$catalogsBySuffix[$suffixKey].Add($catLeaf)
+                }
+            }
+        }
+
+        # Windows INF 仕様に従い、現在の OS アーキテクチャに適合する最も具体的な CatalogFile エントリを優先する
+        # (例: AMD64 環境では CatalogFile.NTamd64 > CatalogFile.NT > CatalogFile)
+        $catalogNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        if ($archSuffix -and $catalogsBySuffix.ContainsKey($archSuffix)) {
+            foreach ($c in $catalogsBySuffix[$archSuffix]) { [void]$catalogNames.Add($c) }
+        } elseif ($catalogsBySuffix.ContainsKey('NT')) {
+            foreach ($c in $catalogsBySuffix['NT']) { [void]$catalogNames.Add($c) }
+        } elseif ($catalogsBySuffix.ContainsKey('')) {
+            foreach ($c in $catalogsBySuffix['']) { [void]$catalogNames.Add($c) }
+        } else {
+            foreach ($c in $allDeclaredCatalogs) { [void]$catalogNames.Add($c) }
         }
 
         if ($catalogNames.Count -eq 0) {
@@ -1055,6 +1158,7 @@ function Invoke-DriverExport {
     $hwIdsByDev = @{}
     $compatIdsByDev = @{}
     $drvDescByDev = @{}
+    $devNodeStatusByDev = @{}
 
     if ($allIds.Count -gt 0) {
         $corePropKeys = @(
@@ -1062,7 +1166,8 @@ function Invoke-DriverExport {
             'DEVPKEY_Device_Parent',
             'DEVPKEY_Device_HardwareIds',
             'DEVPKEY_Device_CompatibleIds',
-            'DEVPKEY_Device_DriverDesc'
+            'DEVPKEY_Device_DriverDesc',
+            'DEVPKEY_Device_DevNodeStatus'
         )
         foreach ($prop in (Get-SafePnpDeviceProperties -Devices $allDevices -KeyNames $corePropKeys)) {
             if (-not $prop.InstanceId -or $null -eq $prop.Data) { continue }
@@ -1084,6 +1189,9 @@ function Invoke-DriverExport {
                 'DEVPKEY_Device_DriverDesc' {
                     if ($prop.Data) { $drvDescByDev[[string]$prop.InstanceId] = [string]$prop.Data }
                 }
+                'DEVPKEY_Device_DevNodeStatus' {
+                    if ($null -ne $prop.Data) { $devNodeStatusByDev[[string]$prop.InstanceId] = $prop.Data }
+                }
             }
         }
         # DEVPKEY_Device_DriverExtendedInfs ({A8B865DD-2E3D-4094-AD97-E593A70C75D6} 20) を分離取得
@@ -1104,7 +1212,7 @@ function Invoke-DriverExport {
     if ($MinimalMode -and $infByDev.Count -eq 0) { throw '使用中のINF情報を取得できませんでした。' }
 
     # 必須5カテゴリの適用状態診断
-    $catStatuses = @(Get-CoreCategoryStatus -Devices $presentDevices -InfByDev $infByDev -DriverMap $driverMap -HwIdsByDev $hwIdsByDev -CompatIdsByDev $compatIdsByDev)
+    $catStatuses = @(Get-CoreCategoryStatus -Devices $presentDevices -InfByDev $infByDev -DriverMap $driverMap -HwIdsByDev $hwIdsByDev -CompatIdsByDev $compatIdsByDev -DevNodeStatusByDev $devNodeStatusByDev)
     Write-Host "`n--- 必須カテゴリのドライバ適用状況 ---" -ForegroundColor Cyan
     foreach ($cs in $catStatuses) {
         $stateColor = switch ($cs.State) {
@@ -1126,7 +1234,7 @@ function Invoke-DriverExport {
     }
 
     # 未適用・要注意デバイスの診断
-    $unhealthyDevices = @(Get-UnhealthyOrUnboundDevices -Devices $presentDevices -InfByDev $infByDev -HwIdsByDev $hwIdsByDev -CompatIdsByDev $compatIdsByDev)
+    $unhealthyDevices = @(Get-UnhealthyOrUnboundDevices -Devices $presentDevices -InfByDev $infByDev -HwIdsByDev $hwIdsByDev -CompatIdsByDev $compatIdsByDev -DevNodeStatusByDev $devNodeStatusByDev)
     if ($unhealthyDevices.Count -gt 0) {
         Write-Host ""
         Write-Host "【警告】ドライバが未適用または異常なデバイスが $($unhealthyDevices.Count) 件あります:" -ForegroundColor Yellow
@@ -1855,8 +1963,15 @@ function Invoke-DriverImport {
     $postInfByDev = @{}
     $postHwByDev = @{}
     $postCompatByDev = @{}
+    $postStatusByDev = @{}
     if ($postDevs.Count -gt 0) {
-        foreach ($prop in (Get-SafePnpDeviceProperties -Devices $postDevs -KeyNames @('DEVPKEY_Device_DriverInfPath', 'DEVPKEY_Device_HardwareIds', 'DEVPKEY_Device_CompatibleIds'))) {
+        $postPropKeys = @(
+            'DEVPKEY_Device_DriverInfPath',
+            'DEVPKEY_Device_HardwareIds',
+            'DEVPKEY_Device_CompatibleIds',
+            'DEVPKEY_Device_DevNodeStatus'
+        )
+        foreach ($prop in (Get-SafePnpDeviceProperties -Devices $postDevs -KeyNames $postPropKeys)) {
             if (-not $prop.InstanceId -or $null -eq $prop.Data) { continue }
             switch ($prop.KeyName) {
                 'DEVPKEY_Device_DriverInfPath' {
@@ -1870,10 +1985,18 @@ function Invoke-DriverImport {
                     $compatVals = @($prop.Data | ForEach-Object { [string]$_ } | Where-Object { $_ })
                     if ($compatVals.Count -gt 0) { $postCompatByDev[[string]$prop.InstanceId] = $compatVals }
                 }
+                'DEVPKEY_Device_DevNodeStatus' {
+                    if ($null -ne $prop.Data) { $postStatusByDev[[string]$prop.InstanceId] = $prop.Data }
+                }
+            }
+        }
+        Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($_.DeviceID -and $_.InfName -and -not $postInfByDev.ContainsKey($_.DeviceID)) {
+                $postInfByDev[$_.DeviceID] = [string]$_.InfName
             }
         }
     }
-    $postUnhealthy = @(Get-UnhealthyOrUnboundDevices -Devices $postDevs -InfByDev $postInfByDev -HwIdsByDev $postHwByDev -CompatIdsByDev $postCompatByDev)
+    $postUnhealthy = @(Get-UnhealthyOrUnboundDevices -Devices $postDevs -InfByDev $postInfByDev -HwIdsByDev $postHwByDev -CompatIdsByDev $postCompatByDev -DevNodeStatusByDev $postStatusByDev)
     if ($postUnhealthy.Count -gt 0) {
         Write-Host "`n【確認】現在もドライバ未適用または要注意のデバイスが $($postUnhealthy.Count) 件あります:" -ForegroundColor Yellow
         foreach ($uh in $postUnhealthy) {
@@ -1902,8 +2025,38 @@ function Invoke-UnboundDeviceFallbackBinding {
     if ($curDevs.Count -eq 0) { return $false }
 
     $curInfByDev = @{}
-    foreach ($prop in (Get-SafePnpDeviceProperties -Devices $curDevs -KeyNames @('DEVPKEY_Device_DriverInfPath'))) {
-        if ($prop.InstanceId -and $prop.Data) { $curInfByDev[[string]$prop.InstanceId] = [string]$prop.Data }
+    $curStatusByDev = @{}
+    $curHwByDev = @{}
+    $curCompatByDev = @{}
+    $fbPropKeys = @(
+        'DEVPKEY_Device_DriverInfPath',
+        'DEVPKEY_Device_DevNodeStatus',
+        'DEVPKEY_Device_HardwareIds',
+        'DEVPKEY_Device_CompatibleIds'
+    )
+    foreach ($prop in (Get-SafePnpDeviceProperties -Devices $curDevs -KeyNames $fbPropKeys)) {
+        if (-not $prop.InstanceId -or $null -eq $prop.Data) { continue }
+        switch ($prop.KeyName) {
+            'DEVPKEY_Device_DriverInfPath' {
+                if ($prop.Data) { $curInfByDev[[string]$prop.InstanceId] = [string]$prop.Data }
+            }
+            'DEVPKEY_Device_DevNodeStatus' {
+                if ($null -ne $prop.Data) { $curStatusByDev[[string]$prop.InstanceId] = $prop.Data }
+            }
+            'DEVPKEY_Device_HardwareIds' {
+                $hwVals = @($prop.Data | ForEach-Object { [string]$_ } | Where-Object { $_ })
+                if ($hwVals.Count -gt 0) { $curHwByDev[[string]$prop.InstanceId] = $hwVals }
+            }
+            'DEVPKEY_Device_CompatibleIds' {
+                $compatVals = @($prop.Data | ForEach-Object { [string]$_ } | Where-Object { $_ })
+                if ($compatVals.Count -gt 0) { $curCompatByDev[[string]$prop.InstanceId] = $compatVals }
+            }
+        }
+    }
+    Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction SilentlyContinue | ForEach-Object {
+        if ($_.DeviceID -and $_.InfName -and -not $curInfByDev.ContainsKey($_.DeviceID)) {
+            $curInfByDev[$_.DeviceID] = [string]$_.InfName
+        }
     }
 
     $unboundCandidates = @(foreach ($dev in $curDevs) {
@@ -1912,8 +2065,8 @@ function Invoke-UnboundDeviceFallbackBinding {
         $prob = if ($dev.PSObject.Properties['Problem'] -and $null -ne $dev.Problem) { [int]$dev.Problem } else { 0 }
         $devClass = [string]$dev.Class
         $inf = if ($curInfByDev.ContainsKey($id)) { $curInfByDev[$id] } else { '' }
-        if (Test-ExpectedDriverlessRawDevice -Device $dev -PrimaryInf $inf) { continue }
-        if ($prob -eq 28 -or ([string]::IsNullOrWhiteSpace($devClass) -and [string]::IsNullOrWhiteSpace($inf))) {
+        if (Test-ExpectedDriverlessRawDevice -Device $dev -PrimaryInf $inf -HwIdsByDev $curHwByDev -CompatIdsByDev $curCompatByDev -DevNodeStatusByDev $curStatusByDev) { continue }
+        if ($prob -eq 28 -or (([string]::IsNullOrWhiteSpace($devClass) -or $devClass -ieq 'Unknown') -and [string]::IsNullOrWhiteSpace($inf))) {
             $dev
         }
     })
@@ -1934,11 +2087,12 @@ function Invoke-UnboundDeviceFallbackBinding {
     foreach ($uDev in $unboundCandidates) {
         $uId = [string]$uDev.InstanceId
         $uName = if ($uDev.FriendlyName) { [string]$uDev.FriendlyName } elseif ($uDev.Name) { [string]$uDev.Name } else { $uId }
-        $hwProp = @(Get-SafePnpDeviceProperties -Devices @($uDev) -KeyNames @('DEVPKEY_Device_HardwareIds')) | Select-Object -First 1
-        $hwIds = if ($hwProp -and $hwProp.Data) {
-            @($hwProp.Data | ForEach-Object { [string]$_ } | Where-Object { $_ })
-        } else {
-            @((Get-DeviceHardwareAndCompatibleIds -Device $uDev).HardwareIds)
+        $hwIds = @((Get-DeviceHardwareAndCompatibleIds -Device $uDev -HwIdsByDev $curHwByDev -CompatIdsByDev $curCompatByDev).HardwareIds)
+        if ($hwIds.Count -eq 0) {
+            $hwProp = @(Get-SafePnpDeviceProperties -Devices @($uDev) -KeyNames @('DEVPKEY_Device_HardwareIds')) | Select-Object -First 1
+            if ($hwProp -and $hwProp.Data) {
+                $hwIds = @($hwProp.Data | ForEach-Object { [string]$_ } | Where-Object { $_ })
+            }
         }
         if ($hwIds.Count -eq 0) { continue }
 
@@ -3033,7 +3187,14 @@ function Invoke-DeviceDiagnostics {
     $infByDev = @{}
     $hwIdsByDev = @{}
     $compatIdsByDev = @{}
-    foreach ($prop in (Get-SafePnpDeviceProperties -Devices $allDevs -KeyNames @('DEVPKEY_Device_DriverInfPath', 'DEVPKEY_Device_HardwareIds', 'DEVPKEY_Device_CompatibleIds'))) {
+    $devNodeStatusByDev = @{}
+    $diagPropKeys = @(
+        'DEVPKEY_Device_DriverInfPath',
+        'DEVPKEY_Device_HardwareIds',
+        'DEVPKEY_Device_CompatibleIds',
+        'DEVPKEY_Device_DevNodeStatus'
+    )
+    foreach ($prop in (Get-SafePnpDeviceProperties -Devices $allDevs -KeyNames $diagPropKeys)) {
         if (-not $prop.InstanceId -or $null -eq $prop.Data) { continue }
         switch ($prop.KeyName) {
             'DEVPKEY_Device_DriverInfPath' {
@@ -3047,6 +3208,9 @@ function Invoke-DeviceDiagnostics {
                 $compatVals = @($prop.Data | ForEach-Object { [string]$_ } | Where-Object { $_ })
                 if ($compatVals.Count -gt 0) { $compatIdsByDev[[string]$prop.InstanceId] = $compatVals }
             }
+            'DEVPKEY_Device_DevNodeStatus' {
+                if ($null -ne $prop.Data) { $devNodeStatusByDev[[string]$prop.InstanceId] = $prop.Data }
+            }
         }
     }
     Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction SilentlyContinue | ForEach-Object {
@@ -3056,7 +3220,7 @@ function Invoke-DeviceDiagnostics {
     }
 
     # 必須カテゴリ診断
-    $catStatuses = @(Get-CoreCategoryStatus -Devices $allDevs -InfByDev $infByDev -HwIdsByDev $hwIdsByDev -CompatIdsByDev $compatIdsByDev)
+    $catStatuses = @(Get-CoreCategoryStatus -Devices $allDevs -InfByDev $infByDev -HwIdsByDev $hwIdsByDev -CompatIdsByDev $compatIdsByDev -DevNodeStatusByDev $devNodeStatusByDev)
     Write-Host '--- 必須5カテゴリのドライバ適用状況 ---' -ForegroundColor Cyan
     foreach ($cs in $catStatuses) {
         $stateColor = switch ($cs.State) {
@@ -3078,7 +3242,7 @@ function Invoke-DeviceDiagnostics {
     }
 
     # 未適用・異常デバイス
-    $unhealthy = @(Get-UnhealthyOrUnboundDevices -Devices $allDevs -InfByDev $infByDev -HwIdsByDev $hwIdsByDev -CompatIdsByDev $compatIdsByDev)
+    $unhealthy = @(Get-UnhealthyOrUnboundDevices -Devices $allDevs -InfByDev $infByDev -HwIdsByDev $hwIdsByDev -CompatIdsByDev $compatIdsByDev -DevNodeStatusByDev $devNodeStatusByDev)
     Write-Host ''
     Write-Host ("--- 未適用・要注意デバイス一覧 ({0} 件) ---" -f $unhealthy.Count) -ForegroundColor Cyan
     if ($unhealthy.Count -eq 0) {

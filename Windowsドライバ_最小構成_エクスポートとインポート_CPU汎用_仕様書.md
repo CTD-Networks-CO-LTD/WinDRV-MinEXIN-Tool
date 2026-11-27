@@ -36,7 +36,7 @@
    - `.cmd` と同一階層直下のフォルダ名のみ許可（既定 `driver`）。パストラバーサル、Windows 予約名、既存ファイル入りフォルダ（上書き禁止）、再解析ポイント（ジャンクション/シンボリックリンク）を拒否する。
 2. **デバイス診断・選別ルール**
    - **仮想デバイス除外**: Hyper-V 仮想スイッチ/NIC、WAN Miniport、Kernel Debug NIC、Wi-Fi Direct Virtual、Bluetooth 仮想 PAN 等を除外する。
-   - **仕様上ドライバレスの内部 RAW PDO / バス論理ノード除外（`Test-ExpectedDriverlessRawDevice`）**: `Problem = 0`（正常稼働）かつ `Class`・`DriverInfPath` 未設定のノードのうち、① `HardwareIds` / `CompatibleIds` を一切報告しない非物理バス上の内部制御 RAW PDO（Realtek Bluetooth フィルタの `RtkFilter0` 等）、および ② AMD ACP バス（`amdacpbus.sys`）の HDA 論理子ノード（`ACP\DEVTYPE_0001*`）は、独立 INF 不要な正規仕様（By Design）として未適用警告・必須カテゴリ異常判定・フォールバックバインド対象から除外する（`Problem != 0` 発生時は通常どおり異常検出する）。
+   - **仕様上ドライバレスの内部 RAW PDO / バス論理ノード除外（`Test-ExpectedDriverlessRawDevice`）**: `Problem = 0`（正常稼働、かつ `DN_HAS_PROBLEM` / `DN_PRIVATE_PROBLEM` フラグ未設定）かつ `DriverInfPath` 未設定のノードのうち、① `DEVPKEY_Device_DevNodeStatus` にデバイスマネージャー通常表示の非表示フラグ `DN_NO_SHOW_IN_DM`（`0x40000000`）が付与された内部ノード（`Class` 空または `'Unknown'` を含む）、② `HardwareIds` / `CompatibleIds` を一切報告しない非物理バス上の内部制御 RAW PDO（Realtek Bluetooth フィルタの `RtkFilter0` 等）、③ AMD ACP バス（`amdacpbus.sys`）の HDA 論理子ノード（`ACP\DEVTYPE_0001*`）、および ④ USB4 ホストルーター（`Usb4HostRouter.sys`）の電力協調用 RAW PDO（`USB4\VIRTUAL_POWER_PDO*`）は、独立 INF 不要な正規仕様（By Design）として未適用警告・必須カテゴリ異常判定・フォールバックバインド対象から除外する（`Problem != 0` 発生時や、`DN_NO_SHOW_IN_DM` 未設定でデバイスマネージャーの「ほかのデバイス」「不明なデバイス」に可視表示される場合は通常どおり異常検出する）。
    - **常時除外クラス**: `Printer` / `PrintQueue` / `Fax`。
    - **最小構成時の保持対象**:
      - 現在接続中デバイスの `DriverInfPath` および `ExtendedInfNames` に紐づく `oem*.inf`
@@ -66,7 +66,7 @@
 1. **事前セキュリティ・完全性検証**
    - 再解析ポイント検査（`Assert-NoReparsePoint`）。
    - マニフェストがある場合は先に完了状態（`Status = 'Complete'`）およびマニフェスト対象ファイルの正常性（存在・サイズ・SHA-256 ハッシュ一致、`OnlineDrivers` がある場合は有効なハードウェアIDの有無）のみを確認する（`Test-BackupIntegrity`）。マニフェスト未登録のファイル（後から同梱したインストーラーや追加ドライバ等）がフォルダ内に存在していてもエラーとしない。未完了の場合は元の Windows から別名で再エクスポートする。
-   - ローカル INF の `CatalogFile`（`.cat`）に対する Authenticode 署名を検証する。マニフェスト検証済みのバックアップでは、署名検証済みの同階層の親 INF が `SourceDisksFiles` に明記し、自身の CAT がすべて存在しない同梱 INF を単独インストール対象から除外する（ファイルは削除しない）。マニフェストが無い場合はこの例外を適用せず、署名検証後に `IMPORT` の明示入力を要求する。
+   - ローカル INF の `CatalogFile`（`.cat`）に対する Authenticode 署名を検証する。同一 INF 内に複数プラットフォーム向け指定（`CatalogFile` と `CatalogFile.NTamd64` 等の併記）がある場合は、Windows INF 仕様に従い実行中 OS アーキテクチャに適合する最も具体的な指定（`CatalogFile.NTamd64` / `NTarm64` / `NTx86` ＞ `CatalogFile.NT` ＞ `CatalogFile`）を検証対象とする。マニフェスト検証済みのバックアップでは、署名検証済みの同階層の親 INF が `SourceDisksFiles` に明記し、自身の CAT がすべて存在しない同梱 INF を単独インストール対象から除外する（ファイルは削除しない）。マニフェストが無い場合はこの例外を適用せず、署名検証後に `IMPORT` の明示入力を要求する。
 2. **フェーズ1：ローカルドライバ復元**
    - マニフェスト付きバックアップでは検証済みの単独インストール対象 INF を `CopyINF` の参照先が先になる順序で個別に `pnputil /add-driver <inf> /install` へ渡す（保留分は全件処理後に1回再試行し、一部旧版・非対応パッケージの失敗で全体が中断しないようにする）。マニフェストなしの場合は従来どおり `<folder>\*.inf /subdirs` を使用する。終了コード `0`・`259`（`ERROR_NO_MORE_ITEMS`：既に登録済み・最新適用済み）・`3010` / `1641`（要再起動）を正常扱いとし、続いて `/scan-devices`（3秒間隔で2回）を実行する。
    - 未適用デバイス（Problem 28 / Null Driver）が残る場合、①マニフェスト記録バインド一致、②オーディオコーデック（`INTELAUDIO` / `HDAUDIO`）の SUBSYS 違い救済の順で検索し、C# P/Invoke（`PnPForcedDriverBinder`：`SetupDi*` + `DiInstallDevice`）で直接バインドする。
@@ -98,10 +98,10 @@
 | 共通・検証 | `Assert-DriverCatalogSignatures` | INF 参照 `.cat` ファイルの Authenticode デジタル署名検証 |
 | 共通・検証 | `Get-PackageFiles` / `Assert-ExportedPackage` / `Test-KnownDriverStoreRuntimeFile` | エクスポート出力のサイズ・SHA-256 照合と DriverStore 内既知実行時生成ファイルの除外判定 |
 | 共通・検証 | `Write-BackupManifest` / `Test-BackupIntegrity` | `driver-backup.json` の出力とマニフェスト対象ファイルの正常性（存在・サイズ・SHA-256）検証 |
-| 共通・検証 | `Get-SafePnpDeviceProperties` / `Get-DeviceHardwareAndCompatibleIds` | WMI クエリ長上限（`WBEM_E_QUOTA_VIOLATION`）を回避する PnP プロパティ一括/分割取得と `HardwareID`/`CompatibleID` フォールバック |
-| 診断 | `Test-ExpectedDriverlessRawDevice` | `Problem = 0` で稼働する仕様上ドライバレスの内部 RAW PDO（`RtkFilter0` 等）および AMD ACP 論理ノード（`ACP\DEVTYPE_0001*`）の判定 |
+| 共通・検証 | `Get-SafePnpDeviceProperties` / `Get-DeviceHardwareAndCompatibleIds` | WMI クエリ長上限（`WBEM_E_QUOTA_VIOLATION`）および並列競合（`-ThrottleLimit 1`）を回避し進捗バーを抑制する PnP プロパティ取得と `HardwareID`/`CompatibleID` フォールバック |
+| 診断 | `Test-ExpectedDriverlessRawDevice` | `Problem = 0` で稼働するデバイスマネージャー非表示ノード（`DN_NO_SHOW_IN_DM`）、内部 RAW PDO（`RtkFilter0` / `USB4\VIRTUAL_POWER_PDO*` 等）、および AMD ACP 論理ノード（`ACP\DEVTYPE_0001*`）の判定 |
 | 診断 | `Get-CoreCategoryStatus` | 必須5カテゴリ（Audio / Video / 有線LAN / 無線LAN / Bluetooth）の状態集計（Video 集計時は `Processor` クラスを除外） |
-| 診断 | `Get-UnhealthyOrUnboundDevices` | PnP 問題コード・Null Driver（仕様上ドライバレスノードを除く）・SST インボックス状態の検出 |
+| 診断 | `Get-UnhealthyOrUnboundDevices` | PnP 問題コード・Null Driver（`Class` 空または `'Unknown'` の可視「ほかのデバイス」を検出し、非表示・仕様上ドライバレスノードを除外）・SST インボックス状態の検出 |
 | エクスポート | `Invoke-DriverExport` | ドライバ選別・オンライン切り替え選択・`pnputil` 出力・検証・レポート生成 |
 | エクスポート | `Get-OnlineEligibleDisplayDrivers` | 物理バス接続 `Display` クラス `oem*.inf` と検索用 ID の動的抽出 |
 | ローカル復元 | `Invoke-DriverImport` | 事前検証・ローカル復元・オンライン復元・事後診断の統括 |
